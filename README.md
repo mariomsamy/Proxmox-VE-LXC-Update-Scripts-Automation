@@ -24,6 +24,8 @@ This project provides a **safe, non-interactive, automation-friendly solution** 
 * Works with Helper-Scripts containers
 * Uses the container’s native package manager (apt, apk, dnf, yum, etc.)
 * Runs automatically on a schedule using `systemd`
+* Prevents overlapping runs with a lock file
+* Validates config ownership and permissions before sourcing it
 
 ---
 
@@ -35,6 +37,10 @@ This project provides a **safe, non-interactive, automation-friendly solution** 
 * ✅ Designed for **Proxmox VE Helper-Scripts**
 * ✅ Compatible with containers normally updated using `update`
 * ✅ Sequential updates (one container at a time)
+* ✅ Per-container timeout with forced cleanup
+* ✅ Config validation before updates begin
+* ✅ Root-owned, non-world-writable config enforcement
+* ✅ systemd hardening for the updater service
 * ✅ Fully non-interactive
 * ✅ systemd timer based scheduling
 * ✅ Optional automatic install of `expect` inside containers
@@ -59,6 +65,14 @@ Run this **on the Proxmox VE host** as `root`:
 curl -fsSL https://raw.githubusercontent.com/mariomsamy/Proxmox-VE-LXC-Update-Scripts-Automation/main/scripts/install.sh | bash
 ```
 
+For a more cautious install, download and inspect the installer first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/mariomsamy/Proxmox-VE-LXC-Update-Scripts-Automation/main/scripts/install.sh
+less install.sh
+bash install.sh
+```
+
 ### What the installer does
 
 * Installs the updater to `/usr/local/sbin/lxc-auto-update.sh`
@@ -66,6 +80,7 @@ curl -fsSL https://raw.githubusercontent.com/mariomsamy/Proxmox-VE-LXC-Update-Sc
 * Installs systemd service & timer
 * Enables automatic daily updates
 * Creates log directory at `/var/log/lxc-auto-update/`
+* Preserves an existing config file and removes group/world write permission from it
 
 ---
 
@@ -166,6 +181,22 @@ LOG_FILE="/var/log/lxc-auto-update/daily.log"
 TERM_DUMB=yes
 ```
 
+#### 🔹 Use apt dist-upgrade instead of upgrade
+
+```bash
+APT_DIST_UPGRADE=no
+```
+
+The default is `no` to reduce behavior surprises during unattended runs.
+
+#### 🔹 Force pacman package database refresh
+
+```bash
+PACMAN_REFRESH=no
+```
+
+The default is `no` to avoid unnecessary full sync refreshes on every run.
+
 > Changes take effect automatically on the next run.
 
 ---
@@ -213,8 +244,20 @@ This allows easy reinstall without losing settings.
 * ❌ Does **not** start stopped containers
 * ❌ Does **not** reboot containers
 * ❌ Does **not** update the Proxmox host
+* ❌ Does **not** snapshot containers before updating
 * ✔ Safe for production Proxmox environments
 * ✔ Designed for automation and cron-like execution
+
+## 🔒 Security Notes
+
+The updater runs as `root` on the Proxmox VE host because `pct exec` requires host-level privileges.
+For that reason:
+
+* Keep `/etc/lxc-auto-update.conf` owned by `root`
+* Do not make the config writable by group or others
+* Exclude sensitive containers until you have tested updates manually
+* Review the installer before piping it to `bash` in production environments
+* Consider taking Proxmox backups or snapshots before enabling unattended upgrades
 
 ---
 

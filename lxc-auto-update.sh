@@ -9,23 +9,89 @@
 set -euo pipefail
 
 CONFIG_FILE="/etc/lxc-auto-update.conf"
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-fi
+LOCK_FILE="/run/lxc-auto-update.lock"
 
 # Defaults (override in /etc/lxc-auto-update.conf)
-LOG_DIR="${LOG_DIR:-/var/log/lxc-auto-update}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/daily.log}"
-PER_CT_TIMEOUT="${PER_CT_TIMEOUT:-1800}"      # seconds per CT
-INSTALL_EXPECT="${INSTALL_EXPECT:-yes}"       # yes|no
-EXCLUDE_CTIDS="${EXCLUDE_CTIDS:-}"            # "101 115"
-TERM_DUMB="${TERM_DUMB:-yes}"                # yes|no
-
-mkdir -p "$LOG_DIR"
+LOG_DIR=""
+LOG_FILE=""
+PER_CT_TIMEOUT=""
+INSTALL_EXPECT=""
+EXCLUDE_CTIDS=""
+TERM_DUMB=""
+APT_DIST_UPGRADE=""
+PACMAN_REFRESH=""
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
-log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
+log() { printf '[%s] %s\n' "$(ts)" "$*" | tee -a "$LOG_FILE"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+require_root() {
+  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "must be run as root on the Proxmox VE host"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+
+  local owner mode
+  owner="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || stat -f '%u' "$CONFIG_FILE")"
+  mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE")"
+
+  [[ "$owner" == "0" ]] || die "$CONFIG_FILE must be owned by root"
+  if (( 10#$mode & 022 )); then
+    die "$CONFIG_FILE must not be writable by group or others"
+  fi
+
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+}
+
+validate_yes_no() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    yes|no) ;;
+    *) die "$name must be yes or no" ;;
+  esac
+}
+
+validate_config() {
+  LOG_DIR="${LOG_DIR:-/var/log/lxc-auto-update}"
+  LOG_FILE="${LOG_FILE:-${LOG_DIR}/daily.log}"
+  PER_CT_TIMEOUT="${PER_CT_TIMEOUT:-1800}"      # seconds per CT
+  INSTALL_EXPECT="${INSTALL_EXPECT:-yes}"       # yes|no
+  EXCLUDE_CTIDS="${EXCLUDE_CTIDS:-}"            # "101 115"
+  TERM_DUMB="${TERM_DUMB:-yes}"                 # yes|no
+  APT_DIST_UPGRADE="${APT_DIST_UPGRADE:-no}"    # yes|no
+  PACMAN_REFRESH="${PACMAN_REFRESH:-no}"        # yes|no
+
+  [[ "$PER_CT_TIMEOUT" =~ ^[0-9]+$ ]] || die "PER_CT_TIMEOUT must be a positive integer"
+  (( PER_CT_TIMEOUT > 0 )) || die "PER_CT_TIMEOUT must be greater than 0"
+  validate_yes_no "INSTALL_EXPECT" "$INSTALL_EXPECT"
+  validate_yes_no "TERM_DUMB" "$TERM_DUMB"
+  validate_yes_no "APT_DIST_UPGRADE" "$APT_DIST_UPGRADE"
+  validate_yes_no "PACMAN_REFRESH" "$PACMAN_REFRESH"
+
+  local ctid
+  for ctid in $EXCLUDE_CTIDS; do
+    [[ "$ctid" =~ ^[0-9]+$ ]] || die "EXCLUDE_CTIDS contains a non-numeric CTID: $ctid"
+  done
+}
+
+setup_runtime() {
+  install -d -m 0755 "$LOG_DIR"
+  touch "$LOG_FILE"
+  chmod 0640 "$LOG_FILE"
+
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "Another lxc-auto-update run is already active. Exiting."
+    exit 0
+  fi
+}
 
 is_excluded() {
   local ctid="$1"
@@ -40,11 +106,16 @@ get_running_cts() {
   pct list | awk '$2 == "running" { print $1 }'
 }
 
+ct_exists() {
+  local ctid="$1"
+  pct status "$ctid" >/dev/null 2>&1
+}
+
 # Avoid login shells to prevent banners/MOTD pollution
 run_in_ct() {
   local ctid="$1"
   local cmd="$2"
-  timeout "${PER_CT_TIMEOUT}s" pct exec "$ctid" -- sh -c "$cmd"
+  timeout --kill-after=30s "${PER_CT_TIMEOUT}s" pct exec "$ctid" -- sh -c "$cmd"
 }
 
 detect_os_id() {
@@ -121,12 +192,15 @@ ensure_expect_installed() {
 
 update_apt() {
   local ctid="$1"
-  log "CT ${ctid}: apt → update/upgrade"
+  local upgrade_cmd="apt-get upgrade -y"
+  [[ "$APT_DIST_UPGRADE" == "yes" ]] && upgrade_cmd="apt-get dist-upgrade -y"
+
+  log "CT ${ctid}: apt - update/upgrade"
   run_in_ct "$ctid" "
     export DEBIAN_FRONTEND=noninteractive
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
     apt-get update -y
-    apt-get upgrade -y
+    $upgrade_cmd
     apt-get autoremove -y
     apt-get autoclean -y
   "
@@ -134,7 +208,7 @@ update_apt() {
 
 update_apk() {
   local ctid="$1"
-  log "CT ${ctid}: apk → update/upgrade"
+  log "CT ${ctid}: apk - update/upgrade"
   run_in_ct "$ctid" "
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
     apk update
@@ -145,7 +219,7 @@ update_apk() {
 
 update_dnf() {
   local ctid="$1"
-  log "CT ${ctid}: dnf → update/upgrade"
+  log "CT ${ctid}: dnf - update/upgrade"
   run_in_ct "$ctid" "
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
     dnf -y upgrade --refresh
@@ -156,7 +230,7 @@ update_dnf() {
 
 update_yum() {
   local ctid="$1"
-  log "CT ${ctid}: yum → update/upgrade"
+  log "CT ${ctid}: yum - update/upgrade"
   run_in_ct "$ctid" "
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
     yum -y update
@@ -167,7 +241,7 @@ update_yum() {
 
 update_zypper() {
   local ctid="$1"
-  log "CT ${ctid}: zypper → update/upgrade"
+  log "CT ${ctid}: zypper - update/upgrade"
   run_in_ct "$ctid" "
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
     zypper --non-interactive refresh
@@ -178,15 +252,26 @@ update_zypper() {
 
 update_pacman() {
   local ctid="$1"
-  log "CT ${ctid}: pacman → update/upgrade"
+  local refresh_flag="-Su"
+  [[ "$PACMAN_REFRESH" == "yes" ]] && refresh_flag="-Syu"
+
+  log "CT ${ctid}: pacman - update/upgrade"
   run_in_ct "$ctid" "
     $( [[ "$TERM_DUMB" == "yes" ]] && echo 'export TERM=dumb' )
-    pacman -Syu --noconfirm
+    pacman ${refresh_flag} --noconfirm
     pacman -Sc --noconfirm || true
   "
 }
 
 main() {
+  require_root
+  require_cmd pct
+  require_cmd timeout
+  require_cmd flock
+  load_config
+  validate_config
+  setup_runtime
+
   log "=== LXC AUTO UPDATE START ==="
 
   local running
@@ -201,9 +286,17 @@ main() {
   [[ -n "$EXCLUDE_CTIDS" ]] && log "Excluded CTIDs: $EXCLUDE_CTIDS"
 
   local ctid os_id pkg_mgr
+  local ok=0 failed=0 skipped=0
   for ctid in $running; do
     if is_excluded "$ctid"; then
       log "--- CT ${ctid}: SKIPPED (excluded) ---"
+      ((skipped += 1))
+      continue
+    fi
+
+    if ! ct_exists "$ctid"; then
+      log "--- CT ${ctid}: SKIPPED (CT no longer exists) ---"
+      ((skipped += 1))
       continue
     fi
 
@@ -212,31 +305,41 @@ main() {
     {
       os_id="$(detect_os_id "$ctid")"
       pkg_mgr="$(detect_pkg_mgr "$ctid")"
-      log "CT ${ctid}: detected OS → ${os_id} | pkg → ${pkg_mgr}"
+      log "CT ${ctid}: detected OS - ${os_id} | pkg - ${pkg_mgr}"
 
       ensure_expect_installed "$ctid" "$pkg_mgr"
 
       case "$pkg_mgr" in
-        apk)    update_apk "$ctid" ;;
-        apt)    update_apt "$ctid" ;;
-        dnf)    update_dnf "$ctid" ;;
-        yum)    update_yum "$ctid" ;;
-        zypper) update_zypper "$ctid" ;;
-        pacman) update_pacman "$ctid" ;;
+        apk|apt|dnf|yum|zypper|pacman)
+          case "$pkg_mgr" in
+            apk)    update_apk "$ctid" ;;
+            apt)    update_apt "$ctid" ;;
+            dnf)    update_dnf "$ctid" ;;
+            yum)    update_yum "$ctid" ;;
+            zypper) update_zypper "$ctid" ;;
+            pacman) update_pacman "$ctid" ;;
+          esac
+
+          log "--- CT ${ctid}: SUCCESS ---"
+          ((ok += 1))
+          ;;
         *)
-          log "CT ${ctid}: unsupported/unknown package manager → skipped"
+          log "CT ${ctid}: unsupported/unknown package manager - skipped"
+          log "--- CT ${ctid}: SKIPPED ---"
+          ((skipped += 1))
           ;;
       esac
-
-      log "--- CT ${ctid}: SUCCESS ---"
     } >>"$LOG_FILE" 2>&1 || {
       rc=$?
       log "--- CT ${ctid}: FAILED (exit $rc) ---"
+      ((failed += 1))
       continue
     }
   done
 
+  log "Summary: success=${ok} failed=${failed} skipped=${skipped}"
   log "=== LXC AUTO UPDATE END ==="
+  (( failed == 0 ))
 }
 
 main "$@"
